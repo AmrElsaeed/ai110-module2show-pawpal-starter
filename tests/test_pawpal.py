@@ -217,3 +217,84 @@ def test_generated_plan_has_no_conflict_warnings():
     s = Scheduler(owner, schedule_date=date(2026, 10, 18))
     s.generate()
     assert s.conflict_warnings() == []
+
+
+# ---- required behaviours: sorting, recurrence, conflict detection ----
+
+def test_sorting_returns_tasks_in_chronological_order():
+    late = _placed("play", time(16, 0), time(16, 15))
+    early = _placed("feeding", time(7, 30), time(7, 40))
+    mid = _placed("walk", time(9, 0), time(9, 30))
+    ten = _placed("grooming", time(10, 0), time(10, 20))   # "10:00" must sort after "9:00"
+    ordered = sort_by_time([late, ten, early, mid])
+    assert ordered == [early, mid, ten, late]
+    starts = [t.scheduled_start for t in ordered]
+    assert starts == sorted(starts)
+
+
+def test_generated_plan_is_chronological_across_pets():
+    owner = Owner("Sam", available_time=[(time(7, 0), time(12, 0))])
+    rex, mochi = Pet("Rex"), Pet("Mochi")
+    owner.add_pet(rex)
+    owner.add_pet(mochi)
+    rex.add_task(Task("walk", duration_minutes=30, preferred_time=time(10, 0), fixed_time=True))
+    mochi.add_task(Task("feeding", duration_minutes=10, preferred_time=time(8, 0), fixed_time=True))
+    rex.add_task(Task("grooming", duration_minutes=20, preferred_time=time(9, 0), fixed_time=True))
+    s = Scheduler(owner, schedule_date=date(2026, 10, 18))
+    s.generate()
+    starts = [t.scheduled_start for t in s.plan]
+    assert len(starts) == 3 and starts == sorted(starts)
+
+
+def test_completing_daily_task_creates_task_for_following_day():
+    pet = Pet("Rex")
+    daily = Task("feeding", "Breakfast", frequency="daily", duration_minutes=10,
+                 preferred_time=time(8, 0))
+    pet.add_task(daily)
+    nxt = pet.complete_task(daily.task_id, on=date(2026, 12, 31))   # year rollover
+    assert daily.completed
+    assert nxt is not None and nxt in pet.tasks and nxt is not daily
+    assert nxt.due_date == date(2027, 1, 1)
+    assert not nxt.completed
+    assert (nxt.task_type, nxt.description, nxt.preferred_time) == \
+           ("feeding", "Breakfast", time(8, 0))
+    assert len(pet.tasks) == 2
+
+
+def test_scheduler_flags_two_tasks_at_exact_same_time():
+    owner = Owner("Sam", buffer_minutes=0)
+    pet = Pet("Rex")
+    owner.add_pet(pet)
+    a, b = Task("walk"), Task("feeding")
+    pet.add_task(a)
+    pet.add_task(b)
+    for t in (a, b):
+        t.scheduled_start, t.scheduled_end = time(9, 0), time(9, 30)
+    s = Scheduler(owner)
+    assert len(s.conflict_warnings([a, b])) == 1
+    assert "Conflict for Rex" in s.conflict_warnings([a, b])[0]
+    assert [(x, y) for x, y, _ in detect_conflicts([a, b])] == [(a, b)]
+
+
+def test_scheduler_does_not_double_book_identical_preferred_times():
+    owner = Owner("Sam", available_time=[(time(8, 0), time(12, 0))], buffer_minutes=0)
+    pet = Pet("Rex")
+    owner.add_pet(pet)
+    pet.add_task(Task("walk", duration_minutes=30, preferred_time=time(9, 0), fixed_time=True))
+    pet.add_task(Task("feeding", duration_minutes=30, preferred_time=time(9, 0), fixed_time=True))
+    s = Scheduler(owner, schedule_date=date(2026, 10, 18))
+    s.generate()
+    assert len(s.plan) == 1 and len(s.unscheduled_tasks) == 1
+    assert s.conflicts() == []
+
+
+def test_pet_with_no_tasks_and_empty_owner_are_handled():
+    owner = Owner("Sam")
+    assert sort_by_time([]) == []
+    s = Scheduler(owner, schedule_date=date(2026, 10, 18))
+    s.generate()
+    assert s.plan == [] and s.conflicts() == [] and s.conflict_warnings() == []
+    pet = Pet("Rex")
+    owner.add_pet(pet)
+    s.generate()
+    assert pet.tasks == [] and s.plan == [] and s.validate()
