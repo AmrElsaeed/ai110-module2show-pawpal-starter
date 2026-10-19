@@ -1,0 +1,82 @@
+classDiagram
+    direction LR
+
+    class Owner {
+        +int owner_id
+        +String owner_name
+        +String email
+        +List~Pet~ pets
+        +List~Window~ available_time
+        +List~Window~ blocked_times
+        +Time day_start
+        +Time day_end
+        +int max_total_minutes
+        +int buffer_minutes
+        +List~String~ preferences
+        +add_pet(pet) void
+        +remove_pet(pet_id) void
+        +get_pet(pet_id) Pet
+        +get_all_tasks() List~Task~
+        +add_time_slot(window) void
+        +remove_time_slot(window) void
+        +effective_windows() List~Window~
+        +is_available(t) bool
+    }
+
+    class Pet {
+        +int pet_id
+        +int owner_id
+        +String pet_name
+        +String species
+        +String breed
+        +int age
+        +float weight_kg
+        +String medical_notes
+        +List~Task~ tasks
+        +get_summary() String
+        +update_info(**changes) void
+        +add_task(task) void
+        +remove_task(task_id) void
+        +tasks_due_on(day) List~Task~
+    }
+
+    class Task {
+        +int task_id
+        +int pet_id
+        +String task_type
+        +String description
+        +int duration_minutes
+        +String priority
+        +String frequency
+        +Date due_date
+        +Date last_completed
+        +Time preferred_time
+        +bool fixed_time
+        +bool completed
+        +Time scheduled_start
+        +Time scheduled_end
+        +is_recurring() bool
+        +is_due_on(day) bool
+        +mark_complete(on) void
+        +is_urgent() bool
+    }
+
+    class Scheduler {
+        +Owner owner
+        +Date schedule_date
+        +List~Task~ plan
+        +List~Task~ unscheduled_tasks
+        +DateTime generated_at
+        +total_duration() int
+        +generate() void
+        +sort_by_priority(tasks) List~Task~
+        +validate() bool
+        +explain_plan() String
+        +get_plan_for_pet(pet_id) List~Task~
+        +export_schedule(fmt) String
+    }
+
+    Owner "1" o-- "0..*" Pet : owns
+    Pet "1" o-- "0..*" Task : needs
+    Scheduler "1" --> "1" Owner : plans for
+    Scheduler "1" --> "0..*" Task : plan / unscheduled

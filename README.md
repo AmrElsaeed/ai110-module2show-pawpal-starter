@@ -47,11 +47,18 @@ pip install -r requirements.txt
 Paste a sample of your app's CLI or Streamlit output here so a reader can see what a generated plan looks like:
 
 ```
-# e.g.:
-# Daily plan for Biscuit (Golden Retriever):
-#   08:00 — Morning walk (30 min) [priority: high]
-#   09:00 — Feeding (10 min) [priority: high]
-#   ...
+==================================================
+Today's Schedule - Sunday, October 18, 2026
+Owner: Sam | Pets: Rex, Mochi
+==================================================
+Plan for Sam on 2026-10-18 (85 min scheduled)
+  07:00-07:10  Rex: medication - Joint supplement  [pinned at preferred time]
+  07:30-08:00  Rex: walk - Morning walk  [high priority, at/after preferred time]
+  08:05-08:20  Mochi: play - Feather wand  [low priority, first open slot]
+  17:30-17:50  Rex: training - Sit and stay practice  [medium priority, at/after preferred time]
+  18:00-18:10  Mochi: feeding - Wet food  [high priority, at/after preferred time]
+--------------------------------------------------
+Valid plan: True
 ```
 
 ## 🧪 Testing PawPal+
@@ -80,6 +87,18 @@ Sample test output:
 | Filtering | | e.g., skip tasks if time runs out |
 | Conflict handling | | e.g., overlapping time slots |
 | Recurring tasks | | e.g., daily vs. weekly |
+
+## Shory Implementation Summary
+
+PawPal is a small pet-care scheduler. All the logic is in pawpal_system.py, with a demo in main.py and two tests in tests/test_pawpal.py.
+
+There are four classes:
+
+Task is one thing a pet needs done, like a walk or a dose of medication. It has a duration, a priority, how often it repeats and, optionally, a time you'd like it done. If you mark that time as fixed, the scheduler treats it as a must. Otherwise it's just a hint. Once the scheduler runs, it stamps each task with a start and end time.
+Pet holds the pet's details and its list of tasks.
+Owner holds the person's pets and when they're free: open windows, blocked-off times, a gap to leave between tasks and, if you want one, a cap on total minutes per day.
+Scheduler takes an owner and works out a plan for one day.
+The pieces connect in a chain. The owner has pets, the pets have tasks, and the scheduler walks that chain to collect everything due that day. It puts the fixed-time tasks in first, then fills the gaps with everything else, most important first, using the earliest slot that fits. If something doesn't fit, it's set aside with a note saying why. 
 
 ## 📸 Demo Walkthrough
 
