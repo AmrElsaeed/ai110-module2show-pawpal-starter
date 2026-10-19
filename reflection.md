@@ -6,6 +6,8 @@
 
 - Briefly describe your initial UML design.
 - What classes did you include, and what responsibilities did you assign to each?
+core actions include: schuedlue meds, doctor appointments, enrichments. set priorities, preference and timing
+Classes are Task, Pet, Constraints, ScheduledItem, Owner, GenerateSchedule, and a small TimeSlot
 
 **b. Design changes**
 
@@ -25,6 +27,12 @@
 
 - Describe one tradeoff your scheduler makes.
 - Why is that tradeoff reasonable for this scenario?
+
+My scheduler places tasks greedily: it sorts them by priority (shortest first on ties) and puts each one in the first open slot that fits, honoring the buffer between tasks. It never goes back and rearranges. The cost is that the plan isn't guaranteed to be the best possible. A high-priority 10-minute task that lands in the middle of a 60-minute window can split it into two small gaps, so a later 45-minute task is reported as "no open slot long enough" even though moving the first task would have fit both. A search-based approach (backtracking or optimal packing) could find that arrangement, but it is much more code and gets slow as tasks grow.
+
+I think greedy is the right call here. A pet owner has a handful of tasks a day, and the rule is easy to explain: the most important things get placed first, and each task's "Why" note says so. Critical tasks like medication are never bumped by a lower-priority one, which matters more than squeezing in every last task. When something is skipped, the app says why and suggests the earliest free slot, so the owner can adjust by hand.
+
+The conflict check makes a similar tradeoff. It is lightweight: it checks overlapping time ranges in a single sorted pass and returns warning messages instead of blocking or raising errors. When several tasks overlap, it compares each one only to the latest-ending earlier task, so it may report fewer pairs than exist. This is enough to tell the owner something is wrong without a full pairwise comparison.
 
 ---
 

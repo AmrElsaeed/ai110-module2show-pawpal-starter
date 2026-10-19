@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import bisect
+import calendar
 import csv
 import io
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from itertools import count
 from typing import Any, Literal, Optional
@@ -35,6 +37,14 @@ def _to_time(minutes: int) -> time:
     return time(minutes // 60, minutes % 60)
 
 
+def _add_months(d: date, months: int = 1) -> date:
+    """Add calendar months, clamping to month end (Jan 31 + 1 month = Feb 28/29)."""
+    year, month = divmod(d.year * 12 + d.month - 1 + months, 12)
+    month += 1
+    return d.replace(year=year, month=month,
+                     day=min(d.day, calendar.monthrange(year, month)[1]))
+
+
 def _fmt(t: Optional[time]) -> str:
     """Format a time as HH:MM, or '--:--' if it is None."""
     return t.strftime("%H:%M") if t else "--:--"
@@ -62,6 +72,8 @@ class Task:
     completed: bool = False
     scheduled_start: Optional[time] = None
     scheduled_end: Optional[time] = None
+    # Optional weekday set (Mon=0..Sun=6) for a recurring task, e.g. {0, 2, 4}.
+    weekdays: Optional[set[int]] = None
 
     def __post_init__(self) -> None:
         """Validate priority, frequency and duration."""
@@ -71,6 +83,8 @@ class Task:
             raise ValueError(f"Unknown frequency: {self.frequency!r}")
         if self.duration_minutes <= 0:
             raise ValueError("duration_minutes must be positive")
+        if self.weekdays is not None and not all(0 <= d <= 6 for d in self.weekdays):
+            raise ValueError("weekdays must be in 0..6 (Mon=0)")
 
     @property
     def is_recurring(self) -> bool:
@@ -82,28 +96,66 @@ class Task:
         """Numeric priority (1 = low ... 4 = critical) for sorting."""
         return _PRIORITY_RANK[self.priority]
 
+    def next_due_after(self, on: date) -> date:
+        """The next due date after completing on `on`, per frequency/weekdays."""
+        if self.weekdays:
+            day = on + timedelta(days=1)
+            while day.weekday() not in self.weekdays:
+                day += timedelta(days=1)
+            return day
+        if self.frequency == "monthly":
+            return _add_months(on, 1)
+        return on + timedelta(days=_FREQUENCY_DAYS[self.frequency])
+
     def is_due_on(self, day: date) -> bool:
         """True if this task belongs on `day`, based on frequency, due_date and last_completed."""
+        if self.completed:
+            return False
         if not self.is_recurring:
-            if self.completed:
-                return False
             return self.due_date is None or self.due_date <= day
         if self.due_date is not None and day < self.due_date:
             return False
+        if self.weekdays:
+            return day.weekday() in self.weekdays
         if self.last_completed is not None:
-            interval = _FREQUENCY_DAYS[self.frequency]
-            if (day - self.last_completed).days < interval:
+            if self.frequency == "monthly":
+                return day >= _add_months(self.last_completed, 1)
+            if (day - self.last_completed).days < _FREQUENCY_DAYS[self.frequency]:
                 return False
         return True
 
-    def mark_complete(self, on: Optional[date] = None) -> None:
-        """Record completion; for recurring tasks, advance due_date by `frequency`."""
+    def status(self, today: Optional[date] = None) -> str:
+        """'done', 'overdue' (past due_date, not done) or 'pending'."""
+        if self.completed:
+            return "done"
+        today = today or date.today()
+        if self.due_date is not None and self.due_date < today:
+            return "overdue"
+        return "pending"
+
+    def mark_complete(self, on: Optional[date] = None) -> Optional["Task"]:
+        """Mark this task done and return the next occurrence if it recurs.
+
+        The finished task is kept as history. For a recurring task (daily,
+        weekly, monthly or weekdays) a fresh, pending copy due on the next
+        date is returned; one-off tasks return None. The caller attaches the
+        copy to a pet - use Pet.complete_task or Scheduler.complete_task to
+        have that done automatically.
+        """
         on = on or date.today()
+        nxt = self.next_occurrence(on)
         self.last_completed = on
-        if self.is_recurring:
-            self.due_date = on + timedelta(days=_FREQUENCY_DAYS[self.frequency])
-        else:
-            self.completed = True
+        self.completed = True
+        return nxt
+
+    def next_occurrence(self, on: Optional[date] = None) -> Optional["Task"]:
+        """Fresh copy of a recurring task due at its next date, or None for one-offs."""
+        if not self.is_recurring:
+            return None
+        on = on or date.today()
+        return replace(self, task_id=next(_task_ids), completed=False, last_completed=None,
+                       due_date=self.next_due_after(on),
+                       scheduled_start=None, scheduled_end=None)
 
     def is_urgent(self) -> bool:
         """True if priority is high or critical."""
@@ -162,6 +214,20 @@ class Pet:
         """Return this pet's tasks that are due on `day`."""
         return [t for t in self.tasks if t.is_due_on(day)]
 
+    def complete_task(self, task_id: int, on: Optional[date] = None) -> Optional[Task]:
+        """Complete a task, keeping it as history; recurring tasks spawn the next one.
+
+        Returns the newly spawned task (or None). Missed days are not replayed:
+        only one next occurrence is created, however overdue the task was.
+        """
+        task = next((t for t in self.tasks if t.task_id == task_id), None)
+        if task is None:
+            raise KeyError(f"No task with id {task_id}")
+        nxt = task.mark_complete(on)
+        if nxt is not None:
+            self.add_task(nxt)
+        return nxt
+
 
 @dataclass
 class Owner:
@@ -202,6 +268,18 @@ class Owner:
         """Flatten tasks from self.pets (pets are the single source of truth)."""
         return [t for p in self.pets for t in p.tasks]
 
+    def filter_tasks(self, pet_name: Optional[str] = None,
+                     completed: Optional[bool] = None) -> list[Task]:
+        """This owner's tasks, narrowed by pet name and/or completion status.
+
+        A filter left as None is ignored; an unknown pet name returns [].
+        """
+        return filter_tasks(self.get_all_tasks(), self, pet_name=pet_name, completed=completed)
+
+    def get_pet_by_name(self, name: str) -> Optional[Pet]:
+        """Case-insensitive pet lookup by name."""
+        return {p.pet_name.lower(): p for p in self.pets}.get(name.strip().lower())
+
     def add_time_slot(self, window: Window) -> None:
         """Add an availability window, rejecting one whose start isn't before its end."""
         start, end = window
@@ -236,6 +314,62 @@ class Owner:
     def is_available(self, t: time) -> bool:
         """True if `t` falls inside one of the effective windows."""
         return any(start <= t < end for start, end in self.effective_windows())
+
+
+def sort_by_time(tasks: list[Task]) -> list[Task]:
+    """Order by scheduled start (unscheduled last); ties by priority then id."""
+    return sorted(tasks, key=lambda t: (t.scheduled_start or time.max,
+                                        -t.priority_rank, t.task_id))
+
+
+def insert_by_time(plan: list[Task], task: Task) -> None:
+    """Insert into an already time-sorted plan, keeping it sorted (binary search)."""
+    keys = [t.scheduled_start or time.max for t in plan]
+    plan.insert(bisect.bisect_right(keys, task.scheduled_start or time.max), task)
+
+
+def filter_tasks(tasks: list[Task], owner: Optional[Owner] = None,
+                 pet_name: Optional[str] = None, status: Optional[str] = None,
+                 completed: Optional[bool] = None, task_type: Optional[str] = None,
+                 today: Optional[date] = None) -> list[Task]:
+    """Keep tasks matching every filter given; a filter left as None is ignored.
+
+    `pet_name` needs `owner` to resolve names; an unknown pet yields no tasks.
+    """
+    preds = []
+    if pet_name is not None:
+        pet = owner.get_pet_by_name(pet_name) if owner else None
+        pid = pet.pet_id if pet else None
+        preds.append(lambda t: pid is not None and t.pet_id == pid)
+    if status is not None:
+        preds.append(lambda t: t.status(today) == status)
+    if completed is not None:
+        preds.append(lambda t: t.completed == completed)
+    if task_type is not None:
+        preds.append(lambda t: t.task_type == task_type)
+    return [t for t in tasks if all(p(t) for p in preds)]
+
+
+def detect_conflicts(tasks: list[Task], buffer: int = 0) -> list[tuple[Task, Task, str]]:
+    """Sort-and-sweep overlap check over scheduled tasks, across all pets.
+
+    Each task is compared with the latest-ending task so far, so one long task
+    that overlaps several others reports each clash. Returns (earlier, later, message).
+    """
+    placed = sorted((t for t in tasks if t.scheduled_start and t.scheduled_end),
+                    key=lambda t: _minutes(t.scheduled_start))
+    found: list[tuple[Task, Task, str]] = []
+    latest: Optional[Task] = None
+    for cur in placed:
+        if latest is not None and (_minutes(cur.scheduled_start)
+                                   < _minutes(latest.scheduled_end) + buffer):
+            found.append((latest, cur,
+                          f"{latest.task_type} ({_fmt(latest.scheduled_start)}-"
+                          f"{_fmt(latest.scheduled_end)}) overlaps {cur.task_type} "
+                          f"at {_fmt(cur.scheduled_start)}"))
+        if latest is None or _minutes(cur.scheduled_end) > _minutes(latest.scheduled_end):
+            latest = cur
+    return found
 
 
 @dataclass
@@ -328,7 +462,7 @@ class Scheduler:
             else:
                 place(task, start, why)
 
-        self.plan.sort(key=lambda t: _minutes(t.scheduled_start))  # type: ignore[arg-type]
+        self.plan = sort_by_time(self.plan)
         self.generated_at = datetime.now()
 
     @staticmethod
@@ -353,6 +487,79 @@ class Scheduler:
     def sort_by_priority(self, tasks: list[Task]) -> list[Task]:
         """Highest priority first; ties broken by shortest duration, then task_id."""
         return sorted(tasks, key=lambda t: (-t.priority_rank, t.duration_minutes, t.task_id))
+
+    def complete_task(self, task_id: int, on: Optional[date] = None) -> Optional[Task]:
+        """Complete a task by id (any pet); recurring tasks get their next instance added.
+
+        `on` defaults to the schedule date. Returns the new task, or None.
+        """
+        for pet in self.owner.pets:
+            if any(t.task_id == task_id for t in pet.tasks):
+                return pet.complete_task(task_id, on or self.schedule_date)
+        raise KeyError(f"No task with id {task_id}")
+
+    def conflicts(self) -> list[tuple[Task, Task, str]]:
+        """Overlaps in the current plan (including buffer), across all pets."""
+        return detect_conflicts(self.plan, self.owner.buffer_minutes)
+
+    def conflict_warnings(self, tasks: Optional[list[Task]] = None) -> list[str]:
+        """Human-readable warnings for overlapping tasks; never raises.
+
+        Checks `tasks` (default: the current plan), so hand-placed or edited
+        tasks can be checked too. Same-pet and cross-pet clashes are labelled.
+        Tasks without a start/end time are ignored.
+        """
+        try:
+            pairs = detect_conflicts(self.plan if tasks is None else tasks,
+                                     self.owner.buffer_minutes)
+        except Exception as exc:  # a malformed task must not crash the app
+            return [f"Could not check for conflicts: {exc}"]
+        out = []
+        for a, b, _ in pairs:
+            pa, pb = self._pet_name(a), self._pet_name(b)
+            who = (f"for {pa}" if a.pet_id == b.pet_id else f"between {pa} and {pb}")
+            out.append(f"Conflict {who}: {pa} {a.task_type} "
+                       f"({_fmt(a.scheduled_start)}-{_fmt(a.scheduled_end)}) overlaps "
+                       f"{pb} {b.task_type} ({_fmt(b.scheduled_start)}-{_fmt(b.scheduled_end)})")
+        return out
+
+    def pinned_warnings(self) -> list[str]:
+        """Explain pinned (fixed_time) tasks that could not be placed."""
+        return [f"{self._pet_name(t)}: {t.task_type} pinned at {_fmt(t.preferred_time)} "
+                f"was skipped - {self.reasons.get(t.task_id, '')}"
+                for t in self.unscheduled_tasks if t.fixed_time]
+
+    def suggest_slot(self, task: Task) -> Optional[time]:
+        """Earliest free start for `task` around the current plan, or None."""
+        windows = [(_minutes(s), _minutes(e)) for s, e in self.owner.effective_windows()]
+        busy = [(_minutes(t.scheduled_start), _minutes(t.scheduled_end)) for t in self.plan]
+        start = self._find_slot(task.duration_minutes, windows, busy,
+                                self.owner.buffer_minutes, 0)
+        return None if start is None else _to_time(start)
+
+    def overload_minutes(self) -> int:
+        """Minutes of due-task work beyond available time (0 if it all fits)."""
+        avail = sum(_minutes(e) - _minutes(s) for s, e in self.owner.effective_windows())
+        if self.owner.max_total_minutes is not None:
+            avail = min(avail, self.owner.max_total_minutes)
+        need = sum(t.duration_minutes for t in self.owner.get_all_tasks()
+                   if t.is_due_on(self.schedule_date))
+        return max(0, need - avail)
+
+    def next_task(self, now: time) -> Optional[Task]:
+        """First pending planned task starting at or after `now`."""
+        return next((t for t in self.plan
+                     if not t.completed and t.scheduled_start >= now), None)  # type: ignore[operator]
+
+    def grouped_by_pet(self) -> list[list[Task]]:
+        """Plan split into runs of consecutive tasks for the same pet."""
+        runs: list[list[Task]] = []
+        for t in self.plan:
+            if runs and runs[-1][-1].pet_id == t.pet_id:
+                runs[-1].append(t)
+            else:
+                runs.append([t])
+        return runs
 
     def validate(self) -> bool:
         """Check no overlaps, all tasks inside windows, and max_total_minutes respected."""
@@ -386,8 +593,12 @@ class Scheduler:
                          f"{self._pet_name(t)}: {t.task_type}"
                          f"{' - ' + t.description if t.description else ''}"
                          f"  [{self.reasons.get(t.task_id, '')}]")
+        over = self.overload_minutes()
+        if over:
+            lines.append(f"Warning: {over} min more work than available time.")
+        lines.extend(f"Warning: {m}" for m in self.conflict_warnings())
         if self.unscheduled_tasks:
-            lines.append("Could not schedule:")
+            lines.append("Skipped because:")
             for t in self.unscheduled_tasks:
                 lines.append(f"  {self._pet_name(t)}: {t.task_type} "
                              f"({t.duration_minutes} min) - {self.reasons.get(t.task_id, '')}")
